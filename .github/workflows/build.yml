@@ -4,10 +4,6 @@ on:
   repository_dispatch:
   workflow_dispatch:
     inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: 'false'
       upload_release:
         description: 'Upload to Release'
         required: false
@@ -16,14 +12,6 @@ on:
 env:
   REPO_URL: https://github.com/openwrt/openwrt
   REPO_BRANCH: main
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: config-pz-l8
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
-  UPLOAD_FIRMWARE: true
-  UPLOAD_COWTRANSFER: false
-  UPLOAD_WETRANSFER: false
   TZ: Asia/Shanghai
 
 jobs:
@@ -32,7 +20,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
     - name: Initialize environment
       env:
@@ -40,7 +28,7 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android/sdk /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2204)
+        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev rsync swig unzip zlib1g-dev file wget python3 python3-dev python3-pyelftools python3-setuptools
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
@@ -50,162 +38,49 @@ jobs:
     - name: Clone OpenWrt source
       run: |
         cd /workdir
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        cd openwrt
+        git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
 
-    - name: Apply PR patches (Part 1 - DIY)
+    - name: Apply PR #21495 (ath11k smallbuffers)
       run: |
         cd /workdir/openwrt
-
-        # Apply PR #21495 (ath11k smallbuffers)
-        echo "Applying PR #21495 (ath11k smallbuffers)..."
         curl -L "https://github.com/openwrt/openwrt/pull/21495.patch" -o /tmp/pr21495.patch || true
         if [ -s /tmp/pr21495.patch ]; then
-          git apply /tmp/pr21495.patch || echo "PR #21495 may already be merged or has conflicts, trying with --reject..."
-          git apply --reject --whitespace=fix /tmp/pr21495.patch 2>/dev/null || true
+          git apply /tmp/pr21495.patch || git apply --reject --whitespace=fix /tmp/pr21495.patch || true
         fi
 
-        # Apply PR #21496 (PZ-L8 dual CPU link)
-        echo "Applying PR #21496 (PZ-L8 dual CPU link)..."
-        curl -L "https://github.com/openwrt/openwrt/pull/21496.patch" -o /tmp/pr21496.patch || true
-        if [ -s /tmp/pr21496.patch ]; then
-          git apply /tmp/pr21496.patch || echo "PR #21496 may already be merged or has conflicts, trying with --reject..."
-          git apply --reject --whitespace=fix /tmp/pr21496.patch 2>/dev/null || true
-        fi
-
-    - name: Apply custom patches from repo
+    - name: Apply PR #21496 (PZ-L8 dual CPU link)
       run: |
         cd /workdir/openwrt
-
-        # Copy patches from this repository
-        if [ -d "$GITHUB_WORKSPACE/patches" ]; then
-          echo "Applying custom patches..."
-          cp -r $GITHUB_WORKSPACE/patches/* . 2>/dev/null || true
+        curl -L "https://github.com/openwrt/openwrt/pull/21496.patch" -o /tmp/pr21496.patch || true
+        if [ -s /tmp/pr21496.patch ]; then
+          git apply /tmp/pr21496.patch || git apply --reject --whitespace=fix /tmp/pr21496.patch || true
         fi
 
-        # Copy the ath11k smallbuffers patch if it exists
+    - name: Apply custom patches
+      run: |
+        cd /workdir/openwrt
+        
+        # Copy ath11k smallbuffers patch
         if [ -f "$GITHUB_WORKSPACE/package/kernel/mac80211/patches/ath11k/951-wifi-ath11k-introduct-CONFIG_ATH11K_SMALLBUFFERS.patch" ]; then
-          echo "Copying ath11k smallbuffers patch..."
           mkdir -p package/kernel/mac80211/patches/ath11k
           cp "$GITHUB_WORKSPACE/package/kernel/mac80211/patches/ath11k/951-wifi-ath11k-introduct-CONFIG_ATH11K_SMALLBUFFERS.patch" package/kernel/mac80211/patches/ath11k/
         fi
+        
+        # Copy DSA patches
+        mkdir -p target/linux/qualcommax/patches-6.12
+        cp $GITHUB_WORKSPACE/target/linux/qualcommax/patches-6.12/*.patch target/linux/qualcommax/patches-6.12/ 2>/dev/null || true
 
-        # Copy the DSA patches for dual CPU link
-        for patch in 0752 0754 0755; do
-          if [ -f "$GITHUB_WORKSPACE/target/linux/qualcommax/patches-6.12/${patch}-net-dsa-qca8k"*.patch ]; then
-            echo "Copying DSA patch ${patch}..."
-            mkdir -p target/linux/qualcommax/patches-6.12
-            cp $GITHUB_WORKSPACE/target/linux/qualcommax/patches-6.12/${patch}*.patch target/linux/qualcommax/patches-6.12/
-          fi
-        done
-
-    - name: Update and install feeds
+    - name: Update feeds
       run: |
         cd /workdir/openwrt
-        # Use GitHub mirrors for faster access
-        sed -i 's|https://git.openwrt.org/feed|https://github.com/openwrt|g' feeds.conf.default || true
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Generate configuration file
+    - name: Load configuration
       run: |
         cd /workdir/openwrt
-
-        # Use config file from repository if exists
-        if [ -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
-          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-        else
-          cat > .config << 'EOF'
-# Target device
-CONFIG_TARGET_qualcommax=y
-CONFIG_TARGET_qualcommax_ipq50xx=y
-CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_cmcc_pz-l8=y
-
-# Base system
-CONFIG_PACKAGE_apk-mbedtls=y
-CONFIG_PACKAGE_base-files=y
-CONFIG_PACKAGE_ca-bundle=y
-CONFIG_PACKAGE_dropbear=y
-CONFIG_PACKAGE_fstools=y
-CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
-CONFIG_PACKAGE_kmod-leds-gpio=y
-CONFIG_PACKAGE_libc=y
-CONFIG_PACKAGE_libgcc=y
-CONFIG_PACKAGE_libustream-mbedtls=y
-CONFIG_PACKAGE_logd=y
-CONFIG_PACKAGE_mtd=y
-CONFIG_PACKAGE_netifd=y
-CONFIG_PACKAGE_procd-ujail=y
-CONFIG_PACKAGE_uboot-envtools=y
-CONFIG_PACKAGE_uci=y
-CONFIG_PACKAGE_uclient-fetch=y
-CONFIG_PACKAGE_urandom-seed=y
-CONFIG_PACKAGE_urngd=y
-CONFIG_PACKAGE_zram-swap=y
-
-# WiFi drivers (smallbuffers version)
-CONFIG_PACKAGE_kmod-ath11k-ahb=y
-CONFIG_PACKAGE_kmod-ath11k-smallbuffers=y
-CONFIG_PACKAGE_ath11k-firmware-ipq5018-qcn6122=y
-CONFIG_PACKAGE_ipq-wifi-cmcc_pz-l8=y
-
-# Switch driver
-CONFIG_PACKAGE_kmod-qca-nss-dp=y
-
-# WiFi Mesh support
-CONFIG_PACKAGE_wpad-mesh-mbedtls=y
-
-# LuCI Web interface
-CONFIG_PACKAGE_luci-base=y
-CONFIG_PACKAGE_luci-mod-admin-full=y
-CONFIG_PACKAGE_luci-theme-bootstrap=y
-CONFIG_PACKAGE_uhttpd=y
-CONFIG_PACKAGE_uhttpd-mod-ubus=y
-
-# LuCI Chinese translation
-CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-usteer-zh-cn=y
-
-# Usteer WiFi roaming
-CONFIG_PACKAGE_usteer=y
-
-# Remove DNS components
-CONFIG_PACKAGE_dnsmasq=n
-CONFIG_PACKAGE_dnsmasq-full=n
-
-# Remove DHCP components
-CONFIG_PACKAGE_odhcpd-ipv6only=n
-
-# Remove Firewall components
-CONFIG_PACKAGE_firewall4=n
-CONFIG_PACKAGE_kmod-nft-core=n
-CONFIG_PACKAGE_kmod-nft-fib=n
-CONFIG_PACKAGE_kmod-nft-nat=n
-CONFIG_PACKAGE_kmod-nft-offload=n
-CONFIG_PACKAGE_kmod-nf-conntrack=n
-CONFIG_PACKAGE_kmod-nf-conntrack6=n
-CONFIG_PACKAGE_kmod-nf-flow=n
-CONFIG_PACKAGE_kmod-nf-iptables=n
-CONFIG_PACKAGE_kmod-nf-ipt6=n
-CONFIG_PACKAGE_kmod-nf-nat=n
-CONFIG_PACKAGE_kmod-nf-reject=n
-CONFIG_PACKAGE_kmod-nf-reject6=n
-CONFIG_PACKAGE_iptables-legacy=n
-CONFIG_PACKAGE_iptables-nft=n
-CONFIG_PACKAGE_nftables=n
-
-# Disable PPP
-CONFIG_PACKAGE_ppp=n
-CONFIG_PACKAGE_ppp-mod-pppoe=n
-CONFIG_PACKAGE_kmod-ppp=n
-CONFIG_PACKAGE_kmod-pppoe=n
-
-# Disable other auth methods
-CONFIG_PACKAGE_wpad-basic-mbedtls=n
-CONFIG_PACKAGE_wpad-basic-wolfssl=n
-CONFIG_PACKAGE_wpad-mesh-wolfssl=n
-EOF
+        if [ -f "$GITHUB_WORKSPACE/config-pz-l8" ]; then
+          cp "$GITHUB_WORKSPACE/config-pz-l8" .config
         fi
         make defconfig
 
@@ -218,70 +93,55 @@ EOF
       id: compile
       run: |
         cd /workdir/openwrt
-        echo -e "$(nproc) thread compile"
+        export FORCE_UNSAFE_CONFIGURE=1
+        echo "::group::Build firmware"
         make -j$(nproc) V=s || make -j1 V=s
+        echo "::endgroup::"
 
+    - name: Prepare release
+      if: success()
+      run: |
+        cd /workdir/openwrt
         mkdir -p release/firmware
         cp -r bin/targets/qualcommax/ipq50xx/*pz-l8* release/firmware/ 2>/dev/null || true
         cp -r bin/targets/qualcommax/ipq50xx/sha256sums release/firmware/ 2>/dev/null || true
-
         cd release/firmware
         sha256sum * > sha256sums.txt 2>/dev/null || true
-
-        echo "status=success" >> $GITHUB_OUTPUT
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
         echo "FIRMWARE_DATE=$(date +"%Y%m%d")" >> $GITHUB_ENV
-
         ls -la
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -h
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: OpenWrt-PZ-L8-${{ env.FIRMWARE_DATE }}
+        path: ${{ env.FIRMWARE_PATH }}/*
 
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v1
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: success() && github.event.inputs.upload_release == 'true'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: PZ-L8_${{ env.FIRMWARE_DATE }}
+        tag_name: PZ-L8-${{ env.FIRMWARE_DATE }}
         name: OpenWrt for CMCC PZ-L8 (${{ env.FIRMWARE_DATE }})
         body: |
           ## OpenWrt 固件 - CMCC PZ-L8
 
           ### 包含特性
-          - **PR #21495**: ath11k smallbuffers - 256MB 内存优化
-          - **PR #21496**: PZ-L8 双 CPU 链接 - 2Gbps 支持
+          - PR #21495: ath11k smallbuffers (256MB 内存优化)
+          - PR #21496: PZ-L8 双 CPU 链接 (2Gbps 支持)
 
           ### 软件包
           - 移除: DNS, DHCP, Firewall (纯 AP 模式)
           - 添加: Mesh 网络, Usteer 漫游
           - LuCI 中文界面
-
-          ### 刷写方法
-          1. 从原厂固件升级: 使用 `openwrt-qualcommax-ipq50xx-cmcc_pz-l8-squashfs-sysupgrade.bin`
-          2. 救援模式: 使用 `openwrt-qualcommax-ipq50xx-cmcc_pz-l8-initramfs-uImage.itb`
-
-          构建时间: ${{ env.FIRMWARE_DATE }}
         files: ${{ env.FIRMWARE_PATH }}/*
 
-    - name: Upload firmware artifact
-      uses: actions/upload-artifact@v3
-      if: steps.compile.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt-PZ-L8_${{ env.FIRMWARE_DATE }}
-        path: ${{ env.FIRMWARE_PATH }}/*
-
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      if: (!cancelled())
-      with:
-        retain_days: 7
-        keep_minimum_runs: 3
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.2.0
-      if: (!cancelled())
+    - name: Clean up old releases
+      uses: dev-drprasad/delete-older-releases@v0.3.0
+      if: success()
       with:
         keep_latest: 5
         delete_tags: true
